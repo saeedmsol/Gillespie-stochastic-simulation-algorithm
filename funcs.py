@@ -5,9 +5,9 @@ from scipy.stats import norm
 
 ############# initial condition and rxn arrays ######################
 
-@np.vectorize
 def gaussian_fn(i, mu, sigma):
-    return np.exp(-1 * (i - mu) ** 2 / (2 * sigma ** 2)) / np.sqrt(2 * np.math.pi * sigma ** 2)
+    denominator = np.sqrt(2 * np.math.pi * sigma ** 2)
+    return np.exp(-1 * (i - mu) ** 2 / (2 * sigma ** 2)) / denominator
 
 def gaussian_discrete (x, area, mean, sigma):
     prob_mass = norm.pdf(x, mean, sigma)
@@ -24,20 +24,33 @@ def initial_pop_gaussian (n_bins, tot_pop_t0, mean_t0, sigma_t0):
 def gauss_reaction_matrix (n_bins, n_iterations, centers_xarr, radii_arr, F_tot_arr, rho, mu_tot, q):
 
     D = mu_tot/2     # Diffusion cnst = (1/2) \int y^2 \mu_y
+    x_arr = np.arange(n_bins)
     
     assert centers_xarr.size == n_iterations            # centers are given as indexes
     assert radii_arr.size == n_iterations 
     
-    def birth_gaussian (n_bins, F_tot, center_idx, sigma):  
-        return F_tot * gaussian_fn(np.arange(n_bins), center_idx, sigma) / np.sum(gaussian_fn(np.arange(n_bins), center_idx, sigma))
+    def birth_gaussian (x_arr, F_tot, center_idx, sigma):  
+        g = gaussian_fn(x_arr, center_idx, sigma)
+        return F_tot * g / np.sum(g)
 
     def death(n_bins, rho):
-        return np.array([rho] * n_bins)  # rho: death rate
+        return np.full(n_bins, rho)  # rho: death rate
 
     def left(n_bins, q, mu):  # q and (1-q) divide the total mutation rate, mu, for inward/outward mutations
-        return np.array([0] + [q * mu] * (int(n_bins / 2) - 1) + [mu / 2] + [(1 - q) * mu] * int(n_bins / 2))
+        mid = int(n_bins/2)
+        left_vec = np.zeros(n_bins)
+        left_vec[1:mid] = q * mu
+        left_vec[mid] = mu/2
+        left_vec[mid+1:] = (1-q) * mu
+        return left_vec
 
     def right(n_bins, q, mu):
+        mid = int(n_bins / 2)
+        right_vec = np.zeros(n_bins)
+        right_vec[:mid] = (1-q) * mu
+        right_vec[mid] = mu/2
+        right_vec[mid + 1:-1] = q * mu
+        return right_vec
         return np.array([(1 - q) * mu] * (int(n_bins / 2) - 1) + [mu / 2] + [q * mu] * int(n_bins / 2) + [0])
     
     
