@@ -2,7 +2,11 @@ import numpy as np
 from scipy.stats import norm
 
 class PopulationInitializer:
-    def __init__(self, n_bins: int, total_population: int, mean: float, sigma: float):
+    def __init__(self, 
+                 n_bins: int, 
+                 total_population: int, 
+                 mean: float, 
+                 sigma: float):
         """
         Initializes the PopulationInitializer with parameters for a Gaussian distribution.
 

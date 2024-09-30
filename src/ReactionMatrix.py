@@ -2,8 +2,15 @@ import numpy as np
 from scipy.stats import norm
 
 class ReactionMatrix:
-    def __init__(self, n_bins: int, n_iterations: int, centers: np.ndarray, radii: np.ndarray, 
-                 F_tot: np.ndarray, rho: float, mu_tot: float, q: float):
+    def __init__(self, 
+                 n_bins: int, 
+                 n_iterations: int, 
+                 centers: np.ndarray, 
+                 radii: np.ndarray, 
+                 F_tot: np.ndarray, 
+                 rho: float, 
+                 mu_tot: float, 
+                 q: float):
         """
         Initializes the ReactionMatrix with parameters for reaction rates and Gaussian distribution parameters.
 
