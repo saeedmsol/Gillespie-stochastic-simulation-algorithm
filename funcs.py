@@ -5,10 +5,6 @@ from scipy.stats import norm
 
 ############# initial condition and rxn arrays ######################
 
-def gaussian_fn(i, mu, sigma):
-    denominator = np.sqrt(2 * np.math.pi * sigma ** 2)
-    return np.exp(-1 * (i - mu) ** 2 / (2 * sigma ** 2)) / denominator
-
 def gaussian_discrete (x, area, mean, sigma):
     prob_mass = norm.pdf(x, mean, sigma)
     normalization_factor = area / np.sum(prob_mass)
@@ -29,8 +25,8 @@ def gauss_reaction_matrix (n_bins, n_iterations, centers_xarr, radii_arr, F_tot_
     assert centers_xarr.size == n_iterations            # centers are given as indexes
     assert radii_arr.size == n_iterations 
     
-    def birth_gaussian (x_arr, F_tot, center_idx, sigma):  
-        g = gaussian_fn(x_arr, center_idx, sigma)
+    def birth_gaussian (F_tot, center_idx, sigma):  
+        g = norm.pdf(x_arr, center_idx, sigma)
         return F_tot * g / np.sum(g)
 
     def death(n_bins, rho):
@@ -54,7 +50,7 @@ def gauss_reaction_matrix (n_bins, n_iterations, centers_xarr, radii_arr, F_tot_
         return np.array([(1 - q) * mu] * (int(n_bins / 2) - 1) + [mu / 2] + [q * mu] * int(n_bins / 2) + [0])
     
     
-    birth_array = np.repeat(np.column_stack([birth_gaussian(n_bins, F_tot_arr[i], centers_xarr[i], radii_arr[i]) for i in np.arange(n_iterations)]), 
+    birth_array = np.repeat(np.column_stack([birth_gaussian(F_tot_arr[i], centers_xarr[i], radii_arr[i]) for i in np.arange(n_iterations)]), 
                             2, axis=1)
     birth_array[:,1::2] = 0   
     # birth_array shape: (n_bins, n_regimes)

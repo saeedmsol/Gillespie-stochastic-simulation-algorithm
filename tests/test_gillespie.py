@@ -1,7 +1,7 @@
 import unittest
 import torch
 import numpy as np
-from src.gillespie_ssa import GillespieSSA  # Import your GillespieSSA class from its module
+from gillespie.gillespie_ssa import GillespieSSA  # Import your GillespieSSA class from its module
 
 class TestGillespieSSA(unittest.TestCase):
 

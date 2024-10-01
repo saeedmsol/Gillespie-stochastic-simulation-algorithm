@@ -23,8 +23,8 @@ class GillespieSSA:
             max_population (int): Maximum allowed population before stopping the simulation.
             device (str): The computation device ('cpu' or 'cuda').
         """
-        self.population = torch.tensor(initial_population[:, None], dtype=torch.int32, device=device)
-        self.population = self.population.repeat(1, n_experiments).to(device=device)
+        
+        self.population = torch.tensor(initial_population[:, None], dtype=torch.int64, device=device).repeat(1, n_experiments)    # shape: (n_bins, n_experiments)
         self.total_population = torch.sum(self.population, dim=0, dtype=torch.int64)
         self.n_experiments = n_experiments
         self.max_time = max_time
@@ -56,12 +56,6 @@ class GillespieSSA:
     def perform_gillespie_step(self) -> None:
         """
         Performs one Gillespie step by calculating the reaction time, selecting reactions, and updating populations.
-
-        Args:
-            None
-
-        Returns:
-            None
         """
         # Step 1: Check if random numbers need to be replenished
         if self.rng_counter >= 999:
@@ -69,7 +63,7 @@ class GillespieSSA:
             self.rng_counter = 0
 
         # Step 2: Update the reaction regime based on current time
-        self.update_reaction_regime()
+        self.select_reaction_regime()
 
         # Step 3: Compute propensities based on current populations and reaction rates
         self.compute_propensities()
@@ -86,17 +80,11 @@ class GillespieSSA:
         # Increment random number generator counter
         self.rng_counter += 1
 
-    def update_reaction_regime(self) -> None:
+    def select_reaction_regime(self) -> None:
         """
         Update the current reaction regime based on current time for each experiment.
-
-        Args:
-            None
-
-        Returns:
-            None
         """
-        rxn_regime_mat = torch.lt(self.current_time[:, None], self.regime_endtimes[None, :])
+        rxn_regime_mat = torch.lt(self.current_time[:, None], self.regime_endtimes[None, :]).to(dtype=torch.int32)
         torch.argmax(rxn_regime_mat, dim=1, out=self.regime_index_mat)
         torch.index_select(self.rxn_mat_full, dim=2, index=self.regime_index_mat, out=self.rxn_mat_current)
 
@@ -104,7 +92,7 @@ class GillespieSSA:
         """
         Calculate the propensities for each reaction channel in each bin for all experiments.
         """
-        torch.mul(self.rxn_mat_current, self.population[:, None, :], out=self.propensity_mat)
+        torch.mul(self.rxn_mat_current, self.population[:, None, :], out=self.propensity_mat)   #shape: (n_bins, n_rxn_channels, n_experiments)
         torch.sum(self.propensity_mat, dim=(0, 1), out=self.tot_propensity)
 
     def calculate_reaction_times(self) -> None:
@@ -129,8 +117,8 @@ class GillespieSSA:
         rxn_combined_index = torch.sum(gt_cumsum_propensity, dim=0)
 
         # Convert combined index to bin and reaction type
-        rxn_bin_index = torch.div(rxn_combined_index, self.n_rxn_channels, rounding_mode='floor')
-        operation_index = rxn_combined_index % self.n_rxn_channels
+        rxn_bin_index = torch.div(rxn_combined_index[None, :], self.n_rxn_channels, rounding_mode='floor').long()
+        operation_index = rxn_combined_index[None, :] % self.n_rxn_channels
 
         # Determine the action (birth, death, left-mutation, right-mutation)
         self.update_population(rxn_bin_index, operation_index)
