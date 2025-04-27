@@ -53,7 +53,7 @@ The following Python libraries are required:
 
 1.  **Clone the repository:**
     ```bash
-    git clone [URL of your repository]
+    git clone https://github.com/saeedmsol/Gillespie-stochastic-simulation-algorithm.git
     cd [repository-directory]
     ```
 2.  **Create Environment (Recommended):** Create a virtual environment (e.g., using `conda` or `venv`) to manage dependencies.
