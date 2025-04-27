@@ -1,297 +1,463 @@
+# --- funcs.py ---
+"""
+Contains the original implementations of simulation functions:
+- initial_pop_gaussian: Generates initial population.
+- gauss_reaction_matrix: Generates reaction rate tensor.
+- ssa: Performs the Gillespie SSA using full tensors and masking.
+"""
+import logging
+import time
+from typing import Optional, Tuple
+
 import numpy as np
 import torch
+from numpy.typing import NDArray
 from scipy.stats import norm
+from torch import Tensor
 
+logger = logging.getLogger(__name__)
 
-############# initial condition and rxn arrays ######################
+# --------------------------------------------------------------------------
+# Initial Condition Generation (Original Logic)
+# --------------------------------------------------------------------------
 
-def gaussian_discrete (x, area, mean, sigma):
+def gaussian_discrete (x: NDArray[np.int_], area: int, mean: int, sigma: float) -> NDArray[np.int_]:
+    """
+    Creates a discrete approximation of a Gaussian distribution over integer bins.
+    Uses rounding and a single central correction. (Original Method)
+
+    Args:
+        x: 1D array of bin indices.
+        area: Desired total population (sum of returned counts).
+        mean: Bin index corresponding to the mean of the Gaussian.
+        sigma: Standard deviation of the Gaussian in index units.
+
+    Returns:
+        1D integer array of counts per bin summing to area.
+    """
+    if area <= 0: return np.zeros_like(x, dtype=int)
+    if sigma <= 1e-9: # Handle near-zero sigma
+        result = np.zeros_like(x, dtype=int)
+        if 0 <= mean < len(x):
+            result[mean] = area
+        return result
+
     prob_mass = norm.pdf(x, mean, sigma)
-    normalization_factor = area / np.sum(prob_mass)
+    pdf_sum = np.sum(prob_mass)
+    if pdf_sum < 1e-12: # Prevent division by zero
+        result = np.zeros_like(x, dtype=int)
+        if 0 <= mean < len(x):
+            result[mean] = area
+        return result
+
+    normalization_factor = area / pdf_sum
     prob_mass_normalized = prob_mass * normalization_factor
-    result = np.round(prob_mass_normalized).astype(int)           # Round the probabilities to integers to mimic a discrete distribution
-    result[mean] += area - np.sum(result)                         # add any differences between the desired area and the resulting one to the center
-    return result  
+    result = np.round(prob_mass_normalized).astype(int) # Round the probabilities
+    current_sum = np.sum(result)
+    diff = area - current_sum
+    # Add any difference to the center bin (ensure index is valid)
+    if 0 <= mean < len(result):
+        result[mean] += diff
+        # Ensure counts don't go negative after correction (unlikely but possible)
+        result[mean] = max(0, result[mean])
+    elif diff != 0:
+        logger.warning("Mean index %d out of bounds, cannot apply rounding correction of %d", mean, diff)
 
-def initial_pop_gaussian (n_bins, tot_pop_t0, mean_t0, sigma_t0):
-    return gaussian_discrete(np.arange(n_bins), tot_pop_t0, mean_t0, sigma_t0)
+    # Final check/correction if previous step failed or made center negative
+    final_sum = np.sum(result)
+    if final_sum != area:
+         logger.warning("Final population sum %d differs from target %d after central correction. Attempting fallback.", final_sum, area)
+         # Fallback: assign difference to first available non-zero bin or center if possible
+         correction = area - final_sum
+         if 0 <= mean < len(result):
+             result[mean] += correction
+             result[mean] = max(0, result[mean])
+         else: # If mean invalid, try adding to first bin
+              result[0] += correction
+              result[0] = max(0, result[0])
+         # Check one last time
+         if np.sum(result) != area:
+              logger.error("FATAL: Could not match target population sum %d. Final sum: %d", area, np.sum(result))
 
 
-def gauss_reaction_matrix (n_bins, n_iterations, centers_xarr, radii_arr, F_tot_arr, rho, mu_tot, q):
+    return result
 
-    D = mu_tot/2     # Diffusion cnst = (1/2) \int y^2 \mu_y
+def initial_pop_gaussian (n_bins: int, tot_pop_t0: int, mean_t0_idx: int, sigma_t0: float) -> NDArray[np.int_]:
+    """Generates initial population using original gaussian_discrete."""
+    logger.debug("Generating initial population (original method): N=%d, mean_idx=%d, sigma=%.2f",
+                 tot_pop_t0, mean_t0_idx, sigma_t0)
+    return gaussian_discrete(np.arange(n_bins), tot_pop_t0, mean_t0_idx, sigma_t0)
+
+# --------------------------------------------------------------------------
+# Reaction Matrix Generation (Original Logic)
+# --------------------------------------------------------------------------
+
+def gauss_reaction_matrix (n_bins: int, n_iterations: int,
+                           centers_xarr: NDArray[np.float_], # Note: Original expected indices? No, formula uses L+coord. Okay.
+                           radii_arr: NDArray[np.float_],
+                           F_tot_arr: NDArray[np.float_], # Fitness strength per iteration
+                           rho: float, # Death rate
+                           mu_tot: float, # Total mutation rate
+                           q: float # Mutation bias
+                           ) -> NDArray[np.float_]:
+    """
+    Generates the reaction rate tensor using the original method's structure
+    (internal functions, column_stack, repeat).
+
+    Args:
+        n_bins: Number of bins.
+        n_iterations: Number of birth/death cycles.
+        centers_xarr: Array (size n_iterations) of center locations (as *indices*).
+        radii_arr: Array (size n_iterations) of fitness widths (sigma_v).
+        F_tot_arr: Array (size n_iterations) of total fitness strength per iteration.
+        rho: Baseline death rate (lambda).
+        mu_tot: Total mutation rate (mu).
+        q: Mutation bias towards center (0.5 = symmetric).
+
+    Returns:
+        Reaction tensor shape (n_bins, 4, n_regimes), dtype=float.
+    """
+    logger.debug("Generating reaction matrix (original method): %d iterations", n_iterations)
+    D = mu_tot/2.0 # Not explicitly used inside, but defined in original
     x_arr = np.arange(n_bins)
-    
-    assert centers_xarr.size == n_iterations            # centers are given as indexes
-    assert radii_arr.size == n_iterations 
-    
-    def birth_gaussian (F_tot, center_idx, sigma):  
+
+    # Input validation assertions from original
+    assert centers_xarr.size == n_iterations, f"Center array size {centers_xarr.size} != n_iterations {n_iterations}"
+    assert radii_arr.size == n_iterations, f"Radii array size {radii_arr.size} != n_iterations {n_iterations}"
+    assert F_tot_arr.size == n_iterations, f"Fitness array size {F_tot_arr.size} != n_iterations {n_iterations}"
+
+    # --- Internal Helper Functions (Original Style) ---
+    def birth_gaussian (F_tot: float, center_idx: float, sigma: float) -> NDArray[np.float_]:
+        if sigma <= 1e-9: # Handle zero width
+             rates = np.zeros_like(x_arr, dtype=float)
+             center_int = int(round(center_idx))
+             if 0 <= center_int < n_bins: rates[center_int] = F_tot
+             return rates
         g = norm.pdf(x_arr, center_idx, sigma)
-        return F_tot * g / np.sum(g)
+        g_sum = np.sum(g)
+        if g_sum < 1e-12: return np.zeros_like(x_arr, dtype=float)
+        return F_tot * g / g_sum
 
-    def death(n_bins, rho):
-        return np.full(n_bins, rho)  # rho: death rate
+    def death(n_bins_local: int, rho_local: float) -> NDArray[np.float_]:
+        return np.full(n_bins_local, rho_local)
 
-    def left(n_bins, q, mu):  # q and (1-q) divide the total mutation rate, mu, for inward/outward mutations
-        mid = int(n_bins/2)
-        left_vec = np.zeros(n_bins)
-        left_vec[1:mid] = q * mu
-        left_vec[mid] = mu/2
-        left_vec[mid+1:] = (1-q) * mu
+    def left(n_bins_local: int, q_local: float, mu_local: float) -> NDArray[np.float_]:
+        mid = n_bins_local // 2
+        left_vec = np.zeros(n_bins_local, dtype=float)
+        if mid > 0: # Ensure slices are valid
+             left_vec[1:mid] = q_local * mu_local
+        if 0 <= mid < n_bins_local:
+             left_vec[mid] = mu_local / 2.0
+        if mid + 1 < n_bins_local:
+             left_vec[mid+1:] = (1.0 - q_local) * mu_local
+        # Boundary condition: left[0] is implicitly 0
         return left_vec
 
-    def right(n_bins, q, mu):
-        mid = int(n_bins / 2)
-        right_vec = np.zeros(n_bins)
-        right_vec[:mid] = (1-q) * mu
-        right_vec[mid] = mu/2
-        right_vec[mid + 1:-1] = q * mu
+    def right(n_bins_local: int, q_local: float, mu_local: float) -> NDArray[np.float_]:
+        mid = n_bins_local // 2
+        right_vec = np.zeros(n_bins_local, dtype=float)
+        if mid > 0:
+             right_vec[:mid] = (1.0 - q_local) * mu_local
+        if 0 <= mid < n_bins_local:
+             right_vec[mid] = mu_local / 2.0
+        if mid + 1 < n_bins_local -1: # Exclude last bin for right mutation source
+             right_vec[mid + 1:-1] = q_local * mu_local
+        # Boundary condition: right[-1] is implicitly 0
+        # Original had a redundant return statement here, removed.
         return right_vec
-        return np.array([(1 - q) * mu] * (int(n_bins / 2) - 1) + [mu / 2] + [q * mu] * int(n_bins / 2) + [0])
-    
-    
-    birth_array = np.repeat(np.column_stack([birth_gaussian(F_tot_arr[i], centers_xarr[i], radii_arr[i]) for i in np.arange(n_iterations)]), 
-                            2, axis=1)
-    birth_array[:,1::2] = 0   
-    # birth_array shape: (n_bins, n_regimes)
-    # puts the birth rate arrays in columns, each column repeated next to itself, then the odd columns are set to zero
-    # fitness and death - mutation - fitness and death - ... ; the matrix has elements zero for every other column starting from column 1
 
-    death_array = np.repeat(np.column_stack([death(n_bins, rho) for i in np.arange(n_iterations)]), 2, axis=1)
-    death_array[:,1::2] = 0
+    # --- Assemble Arrays (Original Style) ---
+    birth_rates_per_iter = [birth_gaussian(F_tot_arr[i], centers_xarr[i], radii_arr[i])
+                            for i in range(n_iterations)]
+    birth_array = np.repeat(np.column_stack(birth_rates_per_iter), 2, axis=1)
+    birth_array[:, 1::2] = 0 # Zero out odd columns (death/mutation regime)
 
-    left_array = np.repeat(np.column_stack([left(n_bins, q, mu_tot) for i in np.arange(n_iterations)]), 2, axis=1)
-    left_array[:,0::2] = 0
+    death_rates_per_iter = [death(n_bins, rho) for _ in range(n_iterations)]
+    death_array = np.repeat(np.column_stack(death_rates_per_iter), 2, axis=1)
+    death_array[:, 0::2] = 0 # Zero out even columns (birth regime)
 
-    right_array = np.repeat(np.column_stack([right(n_bins, q, mu_tot) for i in np.arange(n_iterations)]), 2, axis=1)
-    right_array[:,0::2] = 0
-    
-    return np.concatenate((birth_array[:, None], death_array[:, None], left_array[:, None], right_array[:, None]), axis=1)
-    # shape: (n_bins, n_rxn_channels, n_regimes); 
-    
-    
-##########################  Gillespie stochastic algorithm  ##########################
+    left_rates_per_iter = [left(n_bins, q, mu_tot) for _ in range(n_iterations)]
+    left_array = np.repeat(np.column_stack(left_rates_per_iter), 2, axis=1)
+    left_array[:, 0::2] = 0 # Zero out even columns (birth regime)
 
-def ssa (pop_t0, rxn_matrices, reaction_durations, n_experiments, max_time, max_population, device):
-    
-    ##########  initialize population tensors #########
-    
-    initial_population = torch.tensor(pop_t0[:, None], dtype=torch.int32, device=device)        # shape: (n_bins,)
-    population = initial_population.repeat(1, n_experiments).to(device=device)                  # shape: (n_bins, n_experiments)
-    tot_population = torch.sum(population, dim=0, dtype=torch.int64).to(device=device)          # shape: (n_experiments,)
+    right_rates_per_iter = [right(n_bins, q, mu_tot) for _ in range(n_iterations)]
+    right_array = np.repeat(np.column_stack(right_rates_per_iter), 2, axis=1)
+    right_array[:, 0::2] = 0 # Zero out even columns (birth regime)
 
-    current_time = torch.zeros(n_experiments, dtype=torch.float32, device=device)               # shape: (n_experiments,) # tracks the Gillespie time for individual experiments
-    running_experiment_bool = torch.ones(n_experiments, dtype=torch.bool, device=device)        # if False, experiment has ended
-    regime_endtimes = torch.tensor(reaction_durations, dtype=torch.float32, device=device)      # shape: (n_regimes,) as [end_time1, end_time2, ..., t_max] # excludes 0
-                                                                   # recording the population at the end of each regime (=2*iterations) and at the beginning
+    # --- Concatenate into Final Tensor ---
+    # Stack along a new axis (axis=1) to create the channels dimension
+    reaction_tensor = np.stack(
+        (birth_array, death_array, left_array, right_array),
+        axis=1
+    )
+    # Original code used np.concatenate with [:, None], which achieves the same shape.
+    # np.stack is slightly more direct here. Shape: (n_bins, 4, n_regimes)
 
-    current_regime_exp_bool = torch.ones(n_experiments, dtype=torch.bool, device=device)        # if False, the next rxn time is beyond the current rxn regime's end time
-    experiment_index = torch.ones(n_experiments, dtype=torch.bool, device=device)               # True: experiments that receive update in a Gillespie step
+    logger.debug("Generated reaction matrix (original method) with shape %s", reaction_tensor.shape)
+    return reaction_tensor
 
-    rxn_mat_full = torch.tensor(rxn_matrices, device=device, dtype=torch.float32)               # Shape: (n_bins, n_rxn_channels, n_regimes); 
-    # rxn_mat_full has the rates for all reactions in all regimes (alternating between birth only and death+mutation regimes)
-    n_bins = rxn_mat_full.size(0)           # same as population.size(0)
-    n_rxn_channels = rxn_mat_full.size(1)   # n_rxn_channels = 4 (birth, death, left-mutation, right-mutation)
-    n_regimes = rxn_mat_full.size(2)        # n_regimes = 2*n_iteration; each iteration is one round of birth followed by one round of mutation+death
-    n_timepoints = 1 + n_regimes 
-    
-    rxn_mat_current = torch.zeros(n_bins, n_rxn_channels, n_experiments, device=device, dtype=torch.float32)
-    # sub-array of the rxn_mat_full that corresponds to the current rxn regime
-    rxn_regime_mat = torch.zeros(n_experiments, n_regimes, dtype=torch.int32, device=device)
-    # tracks what rxn regime each experiment is in; filled with torch.lt (current_time, regime_end_times)
-    regime_index_mat = torch.zeros(n_experiments, dtype=torch.int64, device=device)
-    # index for next Gillespie rxn in each running experiment; filled with torch.argmax(rxn_regime_mat, dim=1)
-    
+# --------------------------------------------------------------------------
+# Gillespie SSA (Original Logic)
+# --------------------------------------------------------------------------
 
-    trajectory = torch.zeros(*population.size(), n_timepoints, dtype=torch.int32, device=device)    # shape: (n_bins, n_experiments, n_timepoints)
-    trajectory[:, :, 0] = population    # first element: initial population 
+def ssa (pop_t0: NDArray[np.int_], # Expects 1D initial pop
+         rxn_matrices: NDArray[np.float_], # Shape (n_bins, 4, n_regimes)
+         reaction_durations: NDArray[np.float_], # Cumulative end times of regimes
+         n_experiments: int,
+         max_sim_time: float, # Absolute max time cutoff
+         max_population: int,
+         device: str
+         ) -> Tuple[Tensor, Tensor]:
+    """
+    Performs the Gillespie SSA using the original implementation's logic:
+    - Full tensor operations with masking.
+    - int32 population type.
+    - Specific edge case handling for reaction selection.
+    - No explicit population clamping (relies on scatter logic).
+    - Returns PyTorch Tensors.
 
-    
-    
-                                ############## initialize propensity tensors ##############
+    Args:
+        pop_t0: 1D NumPy array for initial population state.
+        rxn_matrices: 3D NumPy array of reaction rates.
+        reaction_durations: 1D NumPy array of cumulative regime end times.
+        n_experiments: Number of simulation replicates.
+        max_sim_time: Absolute simulation time limit.
+        max_population: Population cap.
+        device: PyTorch device ('cpu' or 'cuda').
 
-    propensity_mat = torch.zeros(*rxn_mat_current.size(), device=device)           # shape: (n_bins, n_rxn_channels, n_experiments)
-    cumsum_propensity = torch.zeros(n_bins*n_rxn_channels, n_experiments, dtype=torch.double, device=device)
-    tot_propensity = torch.zeros(n_experiments, dtype=torch.double, device=device)
+    Returns:
+        Tuple (final_population_tensor, trajectory_tensor).
+    """
+    ssa_start_time = time.time()
+    logger.info("Starting SSA (original method)...")
+    dev = torch.device(device) # Use shorter name
 
-    
-    ############    initialize reaction selection tensors
-    
-    rank_propensity = torch.zeros(n_experiments, device=device, dtype=torch.double)      # for choosing rxns in Gillespie updates
-    gt_cumsum_propensity = torch.zeros(n_bins * n_rxn_channels, n_experiments, dtype=torch.int16, device=device)
-    
-    rxn_combined_index = torch.zeros(n_experiments, dtype=torch.int16, device=device)     # for each experiment: a combined index that determines the bin and rxn type
-    rxn_bin_index   = torch.zeros(1, n_experiments, dtype=torch.int64, device=device)
-    increase_index  = torch.zeros(1, n_experiments, dtype=torch.int64, device=device)    # used in updating the population
-    operation_index = torch.zeros(1, n_experiments, dtype=torch.int64, device=device)    # which rxn channel
+    # --- Initialize population tensors ---
+    if pop_t0.ndim != 1: raise ValueError("pop_t0 must be a 1D array")
+    initial_population = torch.tensor(pop_t0[:, None], dtype=torch.int32, device=dev) # Original used int32
+    population = initial_population.repeat(1, n_experiments)
+    tot_population = torch.sum(population, dim=0, dtype=torch.int64,) # Use int64 for sum
 
-    birth_experiment_bool = torch.zeros_like(rxn_bin_index, dtype=population.dtype, device=device)     #True: experiment has a birth event
-    death_experiment_bool = torch.zeros_like(rxn_bin_index, dtype=population.dtype, device=device)     #True: experiment has a death event
-    left_experiment_bool  = torch.zeros_like(rxn_bin_index, dtype=population.dtype, device=device)      #True: experiment has a l_mutation event
-    right_experiment_bool = torch.zeros_like(rxn_bin_index, dtype=population.dtype, device=device)     #True: experiment has a r_mutation event
-    
-    edgeCase_index = torch.zeros(n_experiments, dtype=torch.bool, device=device)                # to deal with edge cases (in choosing rxns) with random number generator
-    exp_range = torch.arange(n_experiments, dtype=torch.int64, device=device)
+    # --- Time and control tensors ---
+    current_time = torch.zeros(n_experiments, dtype=torch.float32, device=dev)
+    running_experiment_bool = torch.ones(n_experiments, dtype=torch.bool, device=dev)
+    regime_endtimes = torch.tensor(reaction_durations, dtype=torch.float32, device=dev)
+    current_regime_exp_bool = torch.ones(n_experiments, dtype=torch.bool, device=dev) # Tracks if reaction happens *before* boundary
+    # experiment_index is used as a temporary boolean mask in the original, renamed tmp_mask for clarity
+    tmp_mask = torch.zeros(n_experiments, dtype=torch.bool, device=dev)
 
+    # --- Reaction matrix tensor ---
+    rxn_mat_full = torch.tensor(rxn_matrices, dtype=torch.float32, device=dev)
+    n_bins = rxn_mat_full.size(0)
+    n_rxn_channels = rxn_mat_full.size(1) # Should be 4
+    n_regimes = rxn_mat_full.size(2)
+    n_timepoints = 1 + n_regimes
+    assert n_rxn_channels == 4, "Reaction matrix must have 4 channels"
 
-    #########  initialize random number generator tensors ##########
+    # --- Workspace tensors (full size) ---
+    rxn_mat_current = torch.zeros(n_bins, n_rxn_channels, n_experiments, dtype=torch.float32, device=dev)
+    rxn_regime_mat = torch.zeros(n_experiments, n_regimes, dtype=torch.bool, device=dev) # Use bool for clarity
+    regime_index_mat = torch.zeros(n_experiments, dtype=torch.long, device=dev) # Use long for indexing
+
+    # --- Trajectory recorder ---
+    trajectory = torch.zeros((n_bins, n_experiments, n_timepoints), dtype=torch.int32, device=dev)
+    trajectory[:, :, 0] = population.clone() # Record initial state
+
+    # --- Propensity tensors ---
+    propensity_mat = torch.zeros_like(rxn_mat_current, dtype=torch.float64, device=dev) # Use float64
+    cumsum_propensity = torch.zeros(n_bins*n_rxn_channels, n_experiments, dtype=torch.float64, device=dev)
+    tot_propensity = torch.zeros(n_experiments, dtype=torch.float64, device=dev)
+
+    # --- Reaction selection tensors ---
+    rank_propensity = torch.zeros(n_experiments, dtype=torch.double, device=dev)
+    # gt_cumsum_propensity = torch.zeros(n_bins * n_rxn_channels, n_experiments, dtype=torch.int16, device=dev) # int16 seems too small
+    gt_cumsum_propensity = torch.zeros(n_bins * n_rxn_channels, n_experiments, dtype=torch.bool, device=dev) # Use bool
+    # rxn_combined_index = torch.zeros(n_experiments, dtype=torch.int16, device=dev) # Use long for index
+    rxn_combined_index = torch.zeros(n_experiments, dtype=torch.long, device=dev)
+    rxn_bin_index   = torch.zeros((1, n_experiments), dtype=torch.long, device=dev) # Use long
+    increase_index  = torch.zeros((1, n_experiments), dtype=torch.long, device=dev)
+    operation_index = torch.zeros((1, n_experiments), dtype=torch.long, device=dev)
+
+    # Reaction type bools (match population dtype for scatter)
+    birth_experiment_bool = torch.zeros_like(rxn_bin_index, dtype=population.dtype, device=dev)
+    death_experiment_bool = torch.zeros_like(rxn_bin_index, dtype=population.dtype, device=dev)
+    left_experiment_bool  = torch.zeros_like(rxn_bin_index, dtype=population.dtype, device=dev)
+    right_experiment_bool = torch.zeros_like(rxn_bin_index, dtype=population.dtype, device=dev)
+
+    # Edge case handling tensors
+    edgeCase_index = torch.zeros(n_experiments, dtype=torch.bool, device=dev)
+    exp_range = torch.arange(n_experiments, dtype=torch.long, device=dev)
+
+    # --- RNG tensors ---
     n_rng = 1000
-    log_rng = torch.zeros(n_experiments, device=device)
-    tau = torch.zeros(n_experiments, device=device)       # for Gillespie times
-    rng = torch.zeros(n_rng, n_experiments, device=device, dtype=torch.double)
-    # generating n_rng (=1000) random numbers for each experiment  # generating in bulk amortizes rng cost
+    log_rng = torch.zeros(n_experiments, dtype=torch.float64, device=dev) # Use float64
+    tau = torch.zeros(n_experiments, dtype=torch.float64, device=dev) # Use float64
+    rng = torch.zeros(n_rng, n_experiments, dtype=torch.double, device=dev)
 
-    ###### initialize rng_counter counters
-    
-    rng_counter = n_rng-1           # for re-generating random numbers
-    gillespie_step = 0  
-    
-    while True: 
-        
-        if rng_counter > n_rng-2:
-            torch.rand(n_rng, n_experiments, device=device, dtype=torch.double, out=rng)       # shape: (n_random_updates, n_experiments); each Gillespie update uses two random numbers (time, rxn)
+    # --- Counters ---
+    rng_counter = n_rng - 1
+    gillespie_step = 0
+
+    # --- Main Loop ---
+    logger.info("Starting SSA loop (original method)...")
+    while True:
+        # --- Refresh RNG Buffer ---
+        if rng_counter > n_rng - 2: # Need two numbers per step (time, reaction)
+            torch.rand(n_rng, n_experiments, device=dev, dtype=torch.double, out=rng)
             rng_counter = 0
 
         gillespie_step += 1
 
-        ############  determine the current reaction regime and reaction matrix  ##########
+        # --- Determine current regime and rates ---
+        torch.lt(current_time[:, None], regime_endtimes[None, :], out=rxn_regime_mat)
+        torch.argmax(rxn_regime_mat.int(), dim=1, out=regime_index_mat) # Convert bool->int for argmax
+        torch.index_select(rxn_mat_full, dim=2, index=regime_index_mat, out=rxn_mat_current)
 
-        torch.lt(current_time[:, None], regime_endtimes[None, :], out=rxn_regime_mat)          # rxn_regime_mat shape: (n_experiments, n_regimes)
-        torch.argmax(rxn_regime_mat, dim=1, out=regime_index_mat)                              # regime_index_mat shape: (n_experiments,); argmax picks the smallest index from multiple maxima
-        torch.index_select(rxn_mat_full, dim=2, index=regime_index_mat, out=rxn_mat_current)   # Shape: rxn_mat_full : (n_bins, n_rxn_channels, n_regimes); index 2 in the rxn matrix: rxn regime
-        
+        # --- Calculate propensities ---
+        torch.mul(rxn_mat_current, population[:, None, :].to(rxn_mat_current.dtype), out=propensity_mat) # Match dtypes
+        propensity_mat = propensity_mat.to(torch.float64) # Convert back to float64
+        torch.sum(propensity_mat, dim=(0, 1), out=tot_propensity)
 
-        ############ determine propensities ###################
+        # Add 1 to propensity of inactive simulations (original method)
+        tot_propensity_safe = tot_propensity + (~running_experiment_bool).to(tot_propensity.dtype)
+        # Ensure non-zero for division
+        tot_propensity_safe = torch.clamp(tot_propensity_safe, min=1e-30)
 
-        torch.mul(rxn_mat_current, population[:, None, :], out=propensity_mat)                 # propensity_mat shape: (n_bins, n_rxn_channels, n_experiments)
-        torch.sum(propensity_mat, dim=(0, 1), out=tot_propensity)                              # tot_propensity shape: (n_experiments); sums over bins (0) and rxn channels (1)
 
-        tot_propensity = tot_propensity + ~running_experiment_bool
-        # remove zero elements before computing the inverse
-        # Finished simulations are updated as before but the updates will be masked (through running_experiment_bool)
-
-        ###########  sample tau ###############
-
-        # takes the log of the step'th generated ranodm number for each experiment
-        torch.log(1 / rng[rng_counter, :], out=log_rng)
-        torch.div(log_rng, tot_propensity, out=tau)
+        # --- Sample tau ---
+        # Avoid log(0) or log(negative)
+        current_rng_time = torch.clamp(rng[rng_counter, :], min=1e-30)
+        torch.log(1.0 / current_rng_time, out=log_rng)
+        torch.div(log_rng, tot_propensity_safe, out=tau)
         rng_counter += 1
 
-        ###### track if rxn time was set to the beginning of the next regime 
+        # --- Check for boundary crossing ---
+        potential_next_time = current_time + tau.to(current_time.dtype) * running_experiment_bool # Apply mask
+        torch.ge(potential_next_time, regime_endtimes[regime_index_mat], out=tmp_mask)
+        # tmp_mask is True if next reaction >= boundary time (or if inactive)
 
-        torch.ge((current_time + tau)*running_experiment_bool, regime_endtimes[regime_index_mat], out=experiment_index)
-        # if True: next rxn time > current regime's end time. Move to the next rxn regime
-        # Note: equality only happens for the last regime; in that case, we will have already set current_time to t_End - 1e-6 (see below) which will cause expr_idx to become False
+        # Record trajectory if boundary hit by an *active* simulation
+        boundary_hit_active_mask = tmp_mask & running_experiment_bool
+        if torch.any(boundary_hit_active_mask):
+            boundary_indices = torch.where(boundary_hit_active_mask)[0]
+            regimes_ended = regime_index_mat[boundary_indices]
+            timepoint_to_record = regimes_ended + 1 # 0 is initial state
+            # Ensure indices are valid before assignment
+            valid_tp_mask = timepoint_to_record < trajectory.shape[2]
+            if torch.any(valid_tp_mask):
+                 valid_boundary_indices = boundary_indices[valid_tp_mask]
+                 valid_timepoint_idx = timepoint_to_record[valid_tp_mask]
+                 trajectory[:, valid_boundary_indices, valid_timepoint_idx] = population[:, valid_boundary_indices].clone()
 
-        if experiment_index.any():
-            trajectory[:, experiment_index, regime_index_mat[experiment_index]+1] = population [:,experiment_index]
-            # +1 as intial population is the first element
-        
-        current_regime_exp_bool[experiment_index] = False
-        current_regime_exp_bool[~experiment_index] = True
+        # Update current_regime_exp_bool: True if reaction happens before boundary
+        current_regime_exp_bool = ~tmp_mask
 
-        ##################  updating the time and running_experiment_bool 
-        
-        current_time = torch.min(current_time + tau*running_experiment_bool, regime_endtimes[regime_index_mat])
-        torch.logical_and((current_time >= max_time), running_experiment_bool, out=experiment_index)
-        running_experiment_bool[experiment_index] = False
-        
-        current_time[experiment_index] = max_time - 1e-6    
-        #these are still going through the update process but their updates are masked; 
-        #with -1e-6, the torch.lt(current_time, regime_end_times) doesn't give the wrong index (0)
-        
-        
-        ##########  if all experiments are completed, end the simulation
-        
+        # --- Update time and check for max_time ---
+        current_time = torch.min(potential_next_time, regime_endtimes[regime_index_mat])
+        # Check if max_sim_time reached for active sims
+        max_time_reached_mask = (current_time >= max_sim_time - 1e-6) & running_experiment_bool # Use tolerance
+        if torch.any(max_time_reached_mask):
+            running_experiment_bool[max_time_reached_mask] = False
+            current_time[max_time_reached_mask] = max_sim_time # Set exactly to max_time
+
+        # --- Check if all finished ---
         if (~running_experiment_bool).all():
-            return (population, trajectory)
+            logger.info("All experiments finished at step %d.", gillespie_step)
+            ssa_end_time = time.time()
+            logger.info("SSA (original method) finished in %.2f seconds.", ssa_end_time - ssa_start_time)
+            return (population, trajectory) # Return final population and trajectory
 
-
-        ################    if all experiments have gone to the next regime, skip the rest and go to the next rxn step
-        
-        if (~current_regime_exp_bool).all():
+        # --- Skip reaction update if no active sim had a reaction before boundary ---
+        if (~(running_experiment_bool & current_regime_exp_bool)).all():
             continue
 
-        
-        ########################################################
-        ########## compute reaction indices for all experiments
-        
-        
-        torch.cumsum(propensity_mat.view(-1, n_experiments), dim=0, out=cumsum_propensity)    # cumulatively sums all rxn rates in all bins for every experiment
-        torch.mul(rng[rng_counter, :], tot_propensity, out=rank_propensity)                   # multiply the generated random number with the cumulative sum
-        torch.lt(cumsum_propensity, rank_propensity, out=gt_cumsum_propensity)                # find where the generated random results lie in the axis of reaction rates
-        torch.sum(gt_cumsum_propensity, dim=0, out=rxn_combined_index)                        # for each experiment, a combined index that determines the (bin and rxn type) together
+        # --- Select Reaction ---
+        prop_flat = propensity_mat.view(-1, n_experiments)
+        torch.cumsum(prop_flat, dim=0, out=cumsum_propensity)
+        current_rng_rxn = rng[rng_counter, :]
+        torch.mul(current_rng_rxn, tot_propensity, out=rank_propensity) # Use original tot_propensity here
 
+        # Original method using torch.lt + torch.sum
+        torch.lt(cumsum_propensity, rank_propensity[None, :], out=gt_cumsum_propensity)
+        torch.sum(gt_cumsum_propensity, dim=0, dtype=torch.long, out=rxn_combined_index)
         rng_counter += 1
 
-        
-        # adjust reaction indexing for rng ~ 1.000 due to precision errors in cumsum
-        # i.e. if rng-weighted propensity > max propensity, select last nonzero propensity rxn
-        # these errors appear to be uniform in sign so shouldn't affect ensemble trajectories
+        # --- Apply Edge Case Correction ---
         torch.ge(rxn_combined_index, n_bins * n_rxn_channels, out=edgeCase_index)
-        if edgeCase_index.any():
+        if torch.any(edgeCase_index):
+            logger.debug("Applying edge case fix at step %d", gillespie_step)
+            # This finds the index of the last non-zero element when flipped
             delta = torch.argmax(
-                (torch.flip(propensity_mat.view(-1, n_experiments)[:, edgeCase_index], [0]) > 0).to(torch.int16), dim=0)
-            rxn_combined_index.scatter_(0, exp_range[edgeCase_index],
-                                        (delta + (rxn_combined_index - n_bins * n_rxn_channels)[edgeCase_index] + 1).to(
-                                            torch.int16) * (-1), reduce='add')
+                (torch.flip(prop_flat[:, edgeCase_index], [0]) > 1e-12).int(), dim=0 # Use tolerance > 0
+            )
+            # Calculate the correct index: (n_bins*n_channels - 1) - delta
+            corrected_index = (n_bins * n_rxn_channels - 1) - delta
+            rxn_combined_index[edgeCase_index] = corrected_index.to(rxn_combined_index.dtype)
 
-        
 
-        ############### convert reaction index to population updates
-        
-        torch.floor_divide(rxn_combined_index[None, :], n_rxn_channels, out=rxn_bin_index)           # bin for rxn update 
-        torch.remainder(rxn_combined_index[None, :], n_rxn_channels, out=operation_index)            # rxn channel for rxn update
+        # --- Convert reaction index to updates ---
+        torch.floor_divide(rxn_combined_index[None, :], n_rxn_channels, out=rxn_bin_index)
+        torch.remainder(rxn_combined_index[None, :], n_rxn_channels, out=operation_index)
 
+        # Determine reaction types
         torch.eq(operation_index, 0, out=birth_experiment_bool)
         torch.eq(operation_index, 1, out=death_experiment_bool)
         torch.eq(operation_index, 2, out=left_experiment_bool)
         torch.eq(operation_index, 3, out=right_experiment_bool)
 
-        torch.add(rxn_bin_index, right_experiment_bool, out=increase_index)
-        torch.sub(increase_index, left_experiment_bool, out=increase_index)
-        # increase_index records birth bins, death bins, and the target sites of a mutation bin
+        # Determine target bin index for increase (clamp to handle boundaries)
+        increase_index = torch.clamp(
+            rxn_bin_index + right_experiment_bool.long() - left_experiment_bool.long(),
+            0, n_bins - 1
+        )
 
-        
-        ##### scatter updates
-        
-        population.scatter_(0, rxn_bin_index * running_experiment_bool[None, :],
-                            -1 * (running_experiment_bool * current_regime_exp_bool).to(population.dtype)[None, :], 
-                            reduce='add')
-        
-        population.scatter_(0, increase_index * running_experiment_bool[None, :],
-                            (1 + birth_experiment_bool - death_experiment_bool) * running_experiment_bool * current_regime_exp_bool, 
-                            reduce='add')
+        # --- Apply scatter updates (masked) ---
+        # Mask ensures updates only apply if sim is running AND reaction happened before boundary
+        update_mask = (running_experiment_bool & current_regime_exp_bool).to(population.dtype)[None, :]
 
-        # for birth and death only, increase_index is the same as rxn_bin_index; so the above would subtract one, and then add 1 back, plus the birth-death term
-        # for left and right mutations, the rxn_bin will decrease by one, while the adjacent bins increase by one
+        # Decrement source bin
+        population.scatter_add_(0, rxn_bin_index, -1 * update_mask)
 
-        
-        ####### extinction 
+        # Increment target bin (amount depends on reaction type)
+        increment_amount = (1 + birth_experiment_bool - death_experiment_bool) * update_mask
+        population.scatter_add_(0, increase_index, increment_amount)
 
+        # --- Check extinction ---
         torch.sum(population, dim=0, out=tot_population)
-        torch.logical_and((tot_population == 0), running_experiment_bool, out=experiment_index)
-        
-        if experiment_index.any():
-            running_experiment_bool[experiment_index] = False 
-            
-            for exp_idx in torch.where(experiment_index)[0]:          # iterates over n_experiment and fills the rest of trajectory with the final population
-                for rgm_idx in np.arange(1+regime_index_mat[exp_idx], trajectory.size(2)):
-                   trajectory[:, exp_idx, rgm_idx] = 0 
+        extinct_mask = (tot_population <= 0) & running_experiment_bool # Use <= 0 for safety
+        if torch.any(extinct_mask):
+            logger.debug("Extinction detected at step %d", gillespie_step)
+            running_experiment_bool[extinct_mask] = False
+            # Fill rest of trajectory with zeros for extinct simulations
+            extinct_indices = torch.where(extinct_mask)[0]
+            for exp_idx in extinct_indices:
+                start_fill_tp = regime_index_mat[exp_idx] + 1
+                if start_fill_tp < trajectory.shape[2]:
+                     trajectory[:, exp_idx, start_fill_tp:] = 0
+
+        # --- Check population cap ---
+        escape_mask = (tot_population >= max_population) & running_experiment_bool
+        if torch.any(escape_mask):
+            logger.debug("Population cap hit at step %d", gillespie_step)
+            running_experiment_bool[escape_mask] = False
+            # Fill rest of trajectory with final state for capped simulations
+            escape_indices = torch.where(escape_mask)[0]
+            for exp_idx in escape_indices:
+                start_fill_tp = regime_index_mat[exp_idx] + 1
+                final_state_escape = population[:, exp_idx].clone() # Get state when cap was hit
+                if start_fill_tp < trajectory.shape[2]:
+                     trajectory[:, exp_idx, start_fill_tp:] = final_state_escape[:, None]
 
 
-        
-        ####### escape (reach max_population)
-
-        torch.logical_and((torch.ge(tot_population, max_population)), running_experiment_bool, out=experiment_index)
-        
-        if experiment_index.any():
-            running_experiment_bool[experiment_index] = False
-            
-            for exp_idx in torch.where(experiment_index)[0]:
-               for rgm_idx in np.arange(regime_index_mat[exp_idx]+1, trajectory.size(2)):
-                   trajectory[:, exp_idx, rgm_idx] = population[:,exp_idx]
-
-        ##########  if all experiments are completed (with extinction and escape)
+        # --- Final check if all finished ---
         if (~running_experiment_bool).all():
-            return (population, trajectory)
+            logger.info("All experiments finished at step %d.", gillespie_step)
+            ssa_end_time = time.time()
+            logger.info("SSA (original method) finished in %.2f seconds.", ssa_end_time - ssa_start_time)
+            return (population, trajectory) # Return final population and trajectory
+
+        # --- Periodic Logging ---
+        if gillespie_step % 10000 == 0: # Log less frequently maybe
+            n_active = torch.sum(running_experiment_bool).item()
+            mean_t_active = torch.mean(current_time[running_experiment_bool]).item() if n_active > 0 else max_sim_time
+            logger.debug("Step: %d, Active: %d, Mean Time Active: %.2f", gillespie_step, n_active, mean_t_active)
