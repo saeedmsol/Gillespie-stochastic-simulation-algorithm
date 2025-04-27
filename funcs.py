@@ -1,6 +1,6 @@
 # --- funcs.py ---
 """
-Contains the original implementations of simulation functions:
+Contains the implementations of simulation functions:
 - initial_pop_gaussian: Generates initial population.
 - gauss_reaction_matrix: Generates reaction rate tensor.
 - ssa: Performs the Gillespie SSA using full tensors and masking.
@@ -18,13 +18,13 @@ from torch import Tensor
 logger = logging.getLogger(__name__)
 
 # --------------------------------------------------------------------------
-# Initial Condition Generation (Original Logic)
+# Initial Condition Generation
 # --------------------------------------------------------------------------
 
 def gaussian_discrete (x: NDArray[np.int_], area: int, mean: int, sigma: float) -> NDArray[np.int_]:
     """
     Creates a discrete approximation of a Gaussian distribution over integer bins.
-    Uses rounding and a single central correction. (Original Method)
+    Uses rounding and a single central correction. 
 
     Args:
         x: 1D array of bin indices.
@@ -83,17 +83,17 @@ def gaussian_discrete (x: NDArray[np.int_], area: int, mean: int, sigma: float) 
     return result
 
 def initial_pop_gaussian (n_bins: int, tot_pop_t0: int, mean_t0_idx: int, sigma_t0: float) -> NDArray[np.int_]:
-    """Generates initial population using original gaussian_discrete."""
-    logger.debug("Generating initial population (original method): N=%d, mean_idx=%d, sigma=%.2f",
+    """Generates initial population using gaussian_discrete."""
+    logger.debug("Generating initial population: N=%d, mean_idx=%d, sigma=%.2f",
                  tot_pop_t0, mean_t0_idx, sigma_t0)
     return gaussian_discrete(np.arange(n_bins), tot_pop_t0, mean_t0_idx, sigma_t0)
 
 # --------------------------------------------------------------------------
-# Reaction Matrix Generation (Original Logic)
+# Reaction Matrix Generation 
 # --------------------------------------------------------------------------
 
 def gauss_reaction_matrix (n_bins: int, n_iterations: int,
-                           centers_xarr: NDArray[np.float_], # Note: Original expected indices? No, formula uses L+coord. Okay.
+                           centers_xarr: NDArray[np.float_], # Note: formula uses L+coord. Okay.
                            radii_arr: NDArray[np.float_],
                            F_tot_arr: NDArray[np.float_], # Fitness strength per iteration
                            rho: float, # Death rate
@@ -101,7 +101,7 @@ def gauss_reaction_matrix (n_bins: int, n_iterations: int,
                            q: float # Mutation bias
                            ) -> NDArray[np.float_]:
     """
-    Generates the reaction rate tensor using the original method's structure
+    Generates the reaction rate tensor 
     (internal functions, column_stack, repeat).
 
     Args:
@@ -117,16 +117,16 @@ def gauss_reaction_matrix (n_bins: int, n_iterations: int,
     Returns:
         Reaction tensor shape (n_bins, 4, n_regimes), dtype=float.
     """
-    logger.debug("Generating reaction matrix (original method): %d iterations", n_iterations)
-    D = mu_tot/2.0 # Not explicitly used inside, but defined in original
+    logger.debug("Generating reaction matrix: %d iterations", n_iterations)
+    D = mu_tot/2.0 # Not explicitly used inside
     x_arr = np.arange(n_bins)
 
-    # Input validation assertions from original
+    # Input validation assertions 
     assert centers_xarr.size == n_iterations, f"Center array size {centers_xarr.size} != n_iterations {n_iterations}"
     assert radii_arr.size == n_iterations, f"Radii array size {radii_arr.size} != n_iterations {n_iterations}"
     assert F_tot_arr.size == n_iterations, f"Fitness array size {F_tot_arr.size} != n_iterations {n_iterations}"
 
-    # --- Internal Helper Functions (Original Style) ---
+    # --- Internal Helper Functions  ---
     def birth_gaussian (F_tot: float, center_idx: float, sigma: float) -> NDArray[np.float_]:
         if sigma <= 1e-9: # Handle zero width
              rates = np.zeros_like(x_arr, dtype=float)
@@ -163,10 +163,9 @@ def gauss_reaction_matrix (n_bins: int, n_iterations: int,
         if mid + 1 < n_bins_local -1: # Exclude last bin for right mutation source
              right_vec[mid + 1:-1] = q_local * mu_local
         # Boundary condition: right[-1] is implicitly 0
-        # Original had a redundant return statement here, removed.
         return right_vec
 
-    # --- Assemble Arrays (Original Style) ---
+    # --- Assemble Arrays  ---
     birth_rates_per_iter = [birth_gaussian(F_tot_arr[i], centers_xarr[i], radii_arr[i])
                             for i in range(n_iterations)]
     birth_array = np.repeat(np.column_stack(birth_rates_per_iter), 2, axis=1)
@@ -190,14 +189,14 @@ def gauss_reaction_matrix (n_bins: int, n_iterations: int,
         (birth_array, death_array, left_array, right_array),
         axis=1
     )
-    # Original code used np.concatenate with [:, None], which achieves the same shape.
+    # could np.concatenate with [:, None], which achieves the same shape.
     # np.stack is slightly more direct here. Shape: (n_bins, 4, n_regimes)
 
-    logger.debug("Generated reaction matrix (original method) with shape %s", reaction_tensor.shape)
+    logger.debug("Generated reaction matrix with shape %s", reaction_tensor.shape)
     return reaction_tensor
 
 # --------------------------------------------------------------------------
-# Gillespie SSA (Original Logic)
+# Gillespie SSA 
 # --------------------------------------------------------------------------
 
 def ssa (pop_t0: NDArray[np.int_], # Expects 1D initial pop
@@ -209,7 +208,7 @@ def ssa (pop_t0: NDArray[np.int_], # Expects 1D initial pop
          device: str
          ) -> Tuple[Tensor, Tensor]:
     """
-    Performs the Gillespie SSA using the original implementation's logic:
+    Performs the Gillespie SSA:
     - Full tensor operations with masking.
     - int32 population type.
     - Specific edge case handling for reaction selection.
@@ -229,12 +228,12 @@ def ssa (pop_t0: NDArray[np.int_], # Expects 1D initial pop
         Tuple (final_population_tensor, trajectory_tensor).
     """
     ssa_start_time = time.time()
-    logger.info("Starting SSA (original method)...")
+    logger.info("Starting SSA...")
     dev = torch.device(device) # Use shorter name
 
     # --- Initialize population tensors ---
     if pop_t0.ndim != 1: raise ValueError("pop_t0 must be a 1D array")
-    initial_population = torch.tensor(pop_t0[:, None], dtype=torch.int32, device=dev) # Original used int32
+    initial_population = torch.tensor(pop_t0[:, None], dtype=torch.int32, device=dev) 
     population = initial_population.repeat(1, n_experiments)
     tot_population = torch.sum(population, dim=0, dtype=torch.int64,) # Use int64 for sum
 
@@ -243,7 +242,7 @@ def ssa (pop_t0: NDArray[np.int_], # Expects 1D initial pop
     running_experiment_bool = torch.ones(n_experiments, dtype=torch.bool, device=dev)
     regime_endtimes = torch.tensor(reaction_durations, dtype=torch.float32, device=dev)
     current_regime_exp_bool = torch.ones(n_experiments, dtype=torch.bool, device=dev) # Tracks if reaction happens *before* boundary
-    # experiment_index is used as a temporary boolean mask in the original, renamed tmp_mask for clarity
+    # experiment_index is used as a temporary boolean mask, renamed tmp_mask for clarity
     tmp_mask = torch.zeros(n_experiments, dtype=torch.bool, device=dev)
 
     # --- Reaction matrix tensor ---
@@ -299,7 +298,7 @@ def ssa (pop_t0: NDArray[np.int_], # Expects 1D initial pop
     gillespie_step = 0
 
     # --- Main Loop ---
-    logger.info("Starting SSA loop (original method)...")
+    logger.info("Starting SSA loop...")
     while True:
         # --- Refresh RNG Buffer ---
         if rng_counter > n_rng - 2: # Need two numbers per step (time, reaction)
@@ -318,7 +317,7 @@ def ssa (pop_t0: NDArray[np.int_], # Expects 1D initial pop
         propensity_mat = propensity_mat.to(torch.float64) # Convert back to float64
         torch.sum(propensity_mat, dim=(0, 1), out=tot_propensity)
 
-        # Add 1 to propensity of inactive simulations (original method)
+        # Add 1 to propensity of inactive simulations
         tot_propensity_safe = tot_propensity + (~running_experiment_bool).to(tot_propensity.dtype)
         # Ensure non-zero for division
         tot_propensity_safe = torch.clamp(tot_propensity_safe, min=1e-30)
@@ -364,7 +363,7 @@ def ssa (pop_t0: NDArray[np.int_], # Expects 1D initial pop
         if (~running_experiment_bool).all():
             logger.info("All experiments finished at step %d.", gillespie_step)
             ssa_end_time = time.time()
-            logger.info("SSA (original method) finished in %.2f seconds.", ssa_end_time - ssa_start_time)
+            logger.info("SSA finished in %.2f seconds.", ssa_end_time - ssa_start_time)
             return (population, trajectory) # Return final population and trajectory
 
         # --- Skip reaction update if no active sim had a reaction before boundary ---
@@ -375,9 +374,9 @@ def ssa (pop_t0: NDArray[np.int_], # Expects 1D initial pop
         prop_flat = propensity_mat.view(-1, n_experiments)
         torch.cumsum(prop_flat, dim=0, out=cumsum_propensity)
         current_rng_rxn = rng[rng_counter, :]
-        torch.mul(current_rng_rxn, tot_propensity, out=rank_propensity) # Use original tot_propensity here
+        torch.mul(current_rng_rxn, tot_propensity, out=rank_propensity) # Use tot_propensity here
 
-        # Original method using torch.lt + torch.sum
+        # using torch.lt + torch.sum
         torch.lt(cumsum_propensity, rank_propensity[None, :], out=gt_cumsum_propensity)
         torch.sum(gt_cumsum_propensity, dim=0, dtype=torch.long, out=rxn_combined_index)
         rng_counter += 1
@@ -453,7 +452,7 @@ def ssa (pop_t0: NDArray[np.int_], # Expects 1D initial pop
         if (~running_experiment_bool).all():
             logger.info("All experiments finished at step %d.", gillespie_step)
             ssa_end_time = time.time()
-            logger.info("SSA (original method) finished in %.2f seconds.", ssa_end_time - ssa_start_time)
+            logger.info("SSA finished in %.2f seconds.", ssa_end_time - ssa_start_time)
             return (population, trajectory) # Return final population and trajectory
 
         # --- Periodic Logging ---
